@@ -16,27 +16,64 @@ import numpy as np
 import io
 import wave
 import tempfile
+import traceback
+import openai
+
+
+# Adiciona tratamento de exceções em threads para diagnóstico
+def thread_exception_handler(args):
+    print(f"Exception in thread {args.thread.name}:")
+    traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+threading.excepthook = thread_exception_handler
 
 
 class VoiceTalkAI:
     def __init__(self):
         self.root = tk.Tk()
         self.setup_ui()
-        self.setup_audio()
-        self.setup_translation()
-        self.setup_whisper()
-        self.setup_openai()
-        self.setup_system_tray()
-        
-        # Controle de estado
+
+        # Inicializar variáveis de estado
         self.is_listening = False
         self.is_minimized = False
         self.audio_queue = queue.Queue()
         self.translation_queue = queue.Queue()
-        
-        # Iniciar automaticamente após 3 segundos (tempo para carregar Whisper)
-        self.root.after(3000, self.start_listening)
-        
+        self.recognizer = None
+        self.microphone = None
+        self.translator = None
+        self.whisper_model = None
+        self.icon = None
+
+        # Garantir que a janela seja exibida imediatamente
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+        # Iniciar o carregamento dos componentes de backend após a UI estar pronta
+        self.root.after(100, self.initialize_components)
+
+    def initialize_components(self):
+        """Inicializa todos os componentes de backend em uma thread para não bloquear a UI."""
+        self.status_label.config(text="🔄 Inicializando...", fg='#ffaa00')
+        threading.Thread(target=self._initialize_backend, daemon=True).start()
+
+    def _initialize_backend(self):
+        """Executa as inicializações pesadas."""
+        try:
+            self.setup_system_tray()
+            self.setup_translation()
+            self.setup_openai()
+            self.setup_audio()  # Pode ser demorado
+            self.setup_whisper() # Mais demorado ainda
+
+            # Após tudo carregado, iniciar a escuta
+            self.root.after(100, self.start_listening)
+
+        except Exception as e:
+            error_message = f"Erro na inicialização: {e}"
+            print(f"❌ {error_message}")
+            self.root.after(0, lambda: self.status_label.config(text=f"❌ {error_message}", fg='#ff6b6b'))
+            self.root.after(0, lambda: messagebox.showerror("Erro Crítico", error_message))
+
     def setup_ui(self):
         """Configura a interface do usuário - Lateral esquerda 15% da tela"""
         self.root.title("Voice Talk AI - Whisper")
@@ -45,8 +82,8 @@ class VoiceTalkAI:
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
         
-        # Definir tamanho: 15% da largura, 80% da altura
-        width = int(screen_width * 0.15)
+        # Definir tamanho: 15% da largura + 200px, 80% da altura
+        width = int(screen_width * 0.15) + 200
         height = int(screen_height * 0.8)
         
         # Posicionar na lateral esquerda
@@ -168,8 +205,8 @@ class VoiceTalkAI:
         
     def setup_audio(self):
         """Configura o sistema de áudio com filtros aprimorados"""
+        self.root.after(0, lambda: self.status_label.config(text="🔄 Configurando áudio..."))
         self.recognizer = sr.Recognizer()
-        self.microphone = sr.Microphone()
         
         # Configurações equilibradas - detectar fala mas evitar ruído
         self.recognizer.energy_threshold = 1500  # Meio termo
@@ -178,45 +215,98 @@ class VoiceTalkAI:
         self.recognizer.phrase_threshold = 0.5  # Threshold médio
         self.recognizer.non_speaking_duration = 0.8  # Duração média
         
-        # Ajustar para ruído ambiente na inicialização
-        print("🎤 Calibrando microfone para ruído ambiente...")
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=2)
-        print(f"✓ Energy threshold: {self.recognizer.energy_threshold}")
-        
+        # Tentar inicializar com o microfone padrão
+        try:
+            self.microphone = sr.Microphone()
+            # Ajustar para ruído ambiente na inicialização
+            print("🎤 Calibrando microfone para ruído ambiente...")
+            self.root.after(0, lambda: self.status_label.config(text="🎤 Calibrando microfone..."))
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=2)
+            print(f"✓ Energy threshold: {self.recognizer.energy_threshold}")
+            self.root.after(0, lambda: self.status_label.config(text="✅ Áudio pronto!", fg='#00ff88'))
+        except Exception as e:
+            print(f"❌ Erro ao inicializar microfone: {e}")
+            self.root.after(0, lambda: self.status_label.config(text="❌ Erro no microfone!", fg='#ff6b6b'))
+            self.root.after(0, lambda: messagebox.showwarning("Erro de Áudio", "Nenhum microfone padrão encontrado ou erro ao acessá-lo. Verifique seus dispositivos de áudio."))
+            self.microphone = None
+
+    def get_audio_devices(self):
+        """Lista todos os dispositivos de áudio disponíveis"""
+        devices = []
+        try:
+            # Obter lista de microfones
+            for i, microphone_name in enumerate(sr.Microphone.list_microphone_names()):
+                devices.append(f"{i}: {microphone_name}")
+            return devices
+        except Exception as e:
+            print(f"Erro ao listar dispositivos: {e}")
+            return ["Padrão"]
+    
+    def refresh_audio_devices(self):
+        """Atualiza a lista de dispositivos de áudio"""
+        try:
+            devices = self.get_audio_devices()
+            if hasattr(self, 'mic_combo'):
+                self.mic_combo['values'] = ["Padrão"] + devices
+            print(f"🔄 Dispositivos atualizados: {len(devices)} encontrados")
+        except Exception as e:
+            print(f"Erro ao atualizar dispositivos: {e}")
+    
+    def change_microphone(self, event=None):
+        """Muda o microfone selecionado"""
+        try:
+            selected = self.mic_var.get()
+            if selected == "Padrão":
+                self.microphone = sr.Microphone()
+            else:
+                # Extrair o índice do dispositivo
+                device_index = int(selected.split(":")[0])
+                self.microphone = sr.Microphone(device_index=device_index)
+            
+            # Recalibrar com o novo microfone
+            print(f"🎤 Trocando para: {selected}")
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=1)
+            print(f"✓ Microfone alterado para: {selected}")
+            
+        except Exception as e:
+            print(f"Erro ao trocar microfone: {e}")
+            self.mic_var.set("Padrão")
+            self.microphone = sr.Microphone()
+    
     def setup_translation(self):
         """Configura o tradutor"""
+        self.root.after(0, lambda: self.status_label.config(text="🔄 Configurando tradutor..."))
         self.translator = Translator()
         
     def setup_whisper(self):
         """Configura o modelo Whisper"""
-        def load_whisper():
-            try:
-                self.status_label.config(text="🔄 Carregando Whisper...")
-                
-                # Suprimir warnings do Whisper
-                import warnings
-                warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
-                
-                # Carregar modelo com configurações otimizadas para CPU
-                self.whisper_model = whisper.load_model("base", device="cpu")
-                self.status_label.config(text="✅ Whisper carregado!", fg='#00ff88')
-                print("✓ Whisper model loaded successfully")
-            except Exception as e:
-                print(f"❌ Erro ao carregar Whisper: {e}")
-                self.whisper_model = None
-                self.status_label.config(text="❌ Erro no Whisper", fg='#ff6b6b')
-        
-        # Carregar em thread separada
-        threading.Thread(target=load_whisper, daemon=True).start()
-        
+        try:
+            self.root.after(0, lambda: self.status_label.config(text="🔄 Carregando Whisper..."))
+            
+            # Suprimir warnings do Whisper
+            import warnings
+            warnings.filterwarnings("ignore", message="FP16 is not supported on CPU")
+            
+            # Carregar modelo com configurações otimizadas para CPU
+            model_name = self.model_var.get()
+            self.whisper_model = whisper.load_model(model_name, device="cpu")
+            self.root.after(0, lambda: self.status_label.config(text="✅ Whisper carregado!", fg='#00ff88'))
+            print("✓ Whisper model loaded successfully")
+        except Exception as e:
+            print(f"❌ Erro ao carregar Whisper: {e}")
+            self.whisper_model = None
+            self.root.after(0, lambda: self.status_label.config(text="❌ Erro no Whisper", fg='#ff6b6b'))
+            self.root.after(0, lambda: messagebox.showerror("Erro Whisper", f"Não foi possível carregar o modelo Whisper: {e}"))
+
     def change_model(self, event=None):
         """Muda o modelo Whisper"""
         if hasattr(self, 'whisper_model'):
             def reload_model():
                 try:
                     model_name = self.model_var.get()
-                    self.status_label.config(text=f"🔄 Carregando {model_name}...")
+                    self.root.after(0, lambda: self.status_label.config(text=f"🔄 Carregando {model_name}..."))
                     
                     # Suprimir warnings
                     import warnings
@@ -224,20 +314,23 @@ class VoiceTalkAI:
                     
                     # Carregar modelo otimizado para CPU
                     self.whisper_model = whisper.load_model(model_name, device="cpu")
-                    self.status_label.config(text=f"✅ {model_name} carregado!", fg='#00ff88')
+                    self.root.after(0, lambda: self.status_label.config(text=f"✅ {model_name} carregado!", fg='#00ff88'))
                     print(f"✓ Whisper model changed to {model_name}")
                 except Exception as e:
                     print(f"❌ Erro ao trocar modelo: {e}")
-                    self.status_label.config(text="❌ Erro no modelo", fg='#ff6b6b')
+                    self.root.after(0, lambda: self.status_label.config(text="❌ Erro no modelo", fg='#ff6b6b'))
             
             threading.Thread(target=reload_model, daemon=True).start()
         
     def setup_openai(self):
         """Configura correção de texto local"""
         try:
-            print("🤖 Sistema de correção de texto configurado")
+            print("🤖 Configurando OpenAI para tradução avançada")
+            openai.api_key = os.getenv("OPENAI_API_KEY")
+            if not openai.api_key:
+                print("⚠️ Variável OPENAI_API_KEY não definida. Tradução avançada desativada.")
         except Exception as e:
-            print(f"❌ Erro ao configurar correção: {e}")
+            print(f"❌ Erro ao configurar OpenAI: {e}")
     
     def correct_text_with_ai(self, text):
         """Corrige texto usando IA local (sem API externa)"""
@@ -292,9 +385,25 @@ class VoiceTalkAI:
                 corrected += '.'
             
             return corrected
-            
         except Exception as e:
             print(f"Erro na correção: {e}")
+            return text
+
+    def translate_with_openai(self, text):
+        """Traduz texto usando OpenAI GPT para maior fidelidade"""
+        try:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo", 
+                messages=[
+                    {"role": "system", "content": "You are a professional translator. Translate English to Portuguese, preserving the original meaning and context."},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.3
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"❌ Erro na tradução OpenAI: {e}")
+            # Fallback simples
             return text
 
     def setup_system_tray(self):
@@ -312,18 +421,22 @@ class VoiceTalkAI:
             
     def start_listening(self):
         """Inicia a captura de áudio"""
-        if not self.is_listening:
-            self.is_listening = True
-            self.status_label.config(text="🔴 ESCUTANDO", fg='#00ff88')
-            
-            # Iniciar threads
-            self.audio_thread = threading.Thread(target=self.audio_loop, daemon=True)
-            self.process_thread = threading.Thread(target=self.process_audio_loop, daemon=True)
-            
-            self.audio_thread.start()
-            self.process_thread.start()
-            
-            print("✓ Captura de áudio iniciada com Whisper")
+        try:
+            if not self.is_listening:
+                self.is_listening = True
+                self.status_label.config(text="🔴 ESCUTANDO", fg='#00ff88')
+                
+                # Iniciar threads
+                self.audio_thread = threading.Thread(target=self.audio_loop, daemon=True)
+                self.process_thread = threading.Thread(target=self.process_audio_loop, daemon=True)
+                
+                self.audio_thread.start()
+                self.process_thread.start()
+                
+                print("✓ Captura de áudio iniciada com Whisper")
+        except Exception as e:
+            print(f"Erro ao iniciar captura: {e}")
+            self.status_label.config(text="❌ Erro ao iniciar", fg='#ff6b6b')
             
     def stop_listening(self):
         """Para a captura de áudio"""
@@ -362,8 +475,11 @@ class VoiceTalkAI:
                     volume = np.sqrt(np.mean(audio_array.astype(np.float64)**2))
                     
                     # Só processar se tiver volume significativo
-                    if volume > 400:  # Limiar médio para equilibrar
+                    if volume > 200:  # Limiar mais baixo para capturar mais áudio
+                        print(f"🔊 Volume detectado: {volume:.1f} - Processando áudio...")
                         self.audio_queue.put(audio)
+                    else:
+                        print(f"🔇 Volume baixo: {volume:.1f} - Ignorando")
                     
             except sr.WaitTimeoutError:
                 # Timeout normal, continuar
@@ -378,18 +494,25 @@ class VoiceTalkAI:
             try:
                 # Pegar áudio da fila
                 audio = self.audio_queue.get(timeout=1)
+                print("🎵 Processando áudio capturado...")
                 
                 # Processar com Whisper se disponível
                 if hasattr(self, 'whisper_model') and self.whisper_model:
                     try:
                         text = self.transcribe_with_whisper(audio)
+                        if text:
+                            print(f"🤖 Whisper transcreveu: {text}")
                     except Exception as e:
                         print(f"Erro Whisper: {e}")
                         # Fallback para Google
                         text = self.transcribe_with_google(audio)
+                        if text:
+                            print(f"🌐 Google transcreveu: {text}")
                 else:
                     # Usar Google se Whisper não estiver disponível
                     text = self.transcribe_with_google(audio)
+                    if text:
+                        print(f"🌐 Google transcreveu: {text}")
                 
                 if text and len(text.strip()) > 0:
                     # Aplicar correção de texto com IA
@@ -399,13 +522,14 @@ class VoiceTalkAI:
                     formatted_text = f"[{timestamp}] {corrected_text}"
                     self.update_english_text(formatted_text)
                     
-                    # Traduzir o texto corrigido
-                    try:
-                        translation = self.translator.translate(corrected_text, src='en', dest='pt')
-                        formatted_translation = f"[{timestamp}] {translation.text}"
-                        self.update_portuguese_text(formatted_translation)
-                    except Exception as e:
-                        print(f"Erro na tradução: {e}")
+                    # Traduzir o texto corrigido com IA avançada
+                    translated = None
+                    if openai.api_key:
+                        translated = self.translate_with_openai(corrected_text)
+                    else:
+                        translated = corrected_text
+                    formatted_translation = f"[{timestamp}] {translated}"
+                    self.update_portuguese_text(formatted_translation)
                         
             except queue.Empty:
                 # Fila vazia, continuar
@@ -458,8 +582,8 @@ class VoiceTalkAI:
             if not words or len(words) < 2:
                 return None
                 
+
             return text
-            
         except Exception as e:
             print(f"Erro Whisper: {e}")
             raise
@@ -473,7 +597,7 @@ class VoiceTalkAI:
         except sr.RequestError as e:
             print(f"Erro Google: {e}")
             return None
-                
+                 
     def update_english_text(self, text):
         """Atualiza o texto em inglês"""
         self.root.after(0, self._update_english_text, text)
@@ -523,22 +647,35 @@ class VoiceTalkAI:
         if self.icon:
             self.icon.stop()
         self.root.quit()
+        self.root.destroy() # Garante que a janela seja destruída
         sys.exit()
         
     def on_closing(self):
-        """Ao fechar a janela"""
+        """Ao fechar a janela - minimizar ao invés de fechar"""
         self.minimize_to_tray()
         
+
     def run(self):
         """Executa a aplicação"""
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            print(f"❌ Exception in mainloop: {e}")
+        finally:
+            print("⚠️ Mainloop exited")
 
 
 def main():
-    print("🚀 Iniciando Voice Talk AI com Whisper...")
-    print("📥 Carregando modelo de IA...")
-    app = VoiceTalkAI()
-    app.run()
+    try:
+        print("🚀 Iniciando Voice Talk AI com Whisper...")
+        app = VoiceTalkAI()
+        app.run()
+    except Exception as e:
+        print(f"❌ Erro crítico na inicialização: {e}")
+        messagebox.showerror("Erro Fatal", f"""Ocorreu um erro fatal e a aplicação não pôde iniciar:
+
+{e}""")
+        input("Pressione Enter para sair...")
 
 
 if __name__ == "__main__":
